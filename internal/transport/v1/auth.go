@@ -1,6 +1,7 @@
 package v1
 
 import (
+	"fmt"
 	"net/http"
 	"strings"
 
@@ -9,13 +10,18 @@ import (
 	"github.com/labstack/echo/v4"
 )
 
+const (
+	AuthorizationHeaderKey = "Authorization"
+	RefreshTokenCookieName = "Refresh-Token"
+)
+
 func (h *Handler) initAuthRoutes(group *echo.Group) {
 	group.POST("/register", h.handlePostRegister)
 	group.POST("/login", h.handlePostLogin)
 	group.POST("/logout", h.handlePostLogout)
 	group.POST("/logoutAll", h.handlePostLogoutAll, h.authMiddleware)
 	group.POST("/refresh", h.handlePostRefresh)
-	group.POST("/verify", h.handlePostVerify)
+	group.GET("/verify", h.handleGetVerify)
 	group.POST("/forgot", h.handlePostForgot)
 	group.POST("/reset", h.handlePostReset)
 }
@@ -34,7 +40,8 @@ func (h *Handler) handlePostRegister(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
 	}
 
-	user, err := h.authService.Register(c.Request().Context(), body.Username, body.Email, body.Password)
+	verificationUrl := fmt.Sprintf("%s://%s%s/verify?token=", c.Scheme(), c.Request().Host, strings.TrimSuffix(c.Request().URL.Path, "/register"))
+	user, err := h.authService.Register(c.Request().Context(), body.Username, body.Email, body.Password, verificationUrl)
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 	}
@@ -57,24 +64,33 @@ func (h *Handler) handlePostLogin(c echo.Context) error {
 	}
 
 	// Login the user
-	accessToken, refreshToken, err := h.authService.Login(c.Request().Context(), body.Login, body.Password, c.RealIP())
+	accessToken, refreshToken, err := h.authService.Login(c.Request().Context(), body.Login, body.Password, c.Request().UserAgent())
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 	}
 
 	// Set the tokens in the response
-	c.Response().Header().Set("Authorization", "Bearer "+accessToken)
-	c.Response().Header().Set("Refresh-Token", refreshToken)
+	c.Response().Header().Set(AuthorizationHeaderKey, "Bearer "+accessToken)
+
+	c.SetCookie(&http.Cookie{
+		Name:     RefreshTokenCookieName,
+		Value:    refreshToken,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   false, // true in production
+		SameSite: http.SameSiteStrictMode,
+	})
 
 	return c.NoContent(http.StatusOK)
 }
 
 func (h *Handler) handlePostLogout(c echo.Context) error {
-	// Get refresh token from the header
-	refreshToken := c.Request().Header.Get("Refresh-Token")
-	if refreshToken == "" {
+	// Get the refresh token from the cookie
+	cookie, err := c.Request().Cookie(RefreshTokenCookieName)
+	if err != nil {
 		return echo.NewHTTPError(http.StatusBadRequest, "missing refresh token")
 	}
+	refreshToken := cookie.Value
 
 	// Logout the user
 	if err := h.authService.Logout(c.Request().Context(), refreshToken); err != nil {
@@ -97,26 +113,35 @@ func (h *Handler) handlePostLogoutAll(c echo.Context) error {
 }
 
 func (h *Handler) handlePostRefresh(c echo.Context) error {
-	// Get the refresh token from the header
-	refreshToken := c.Request().Header.Get("Refresh-Token")
-	if refreshToken == "" {
+	// Get the refresh token from the cookie
+	cookie, err := c.Request().Cookie(RefreshTokenCookieName)
+	if err != nil {
 		return echo.NewHTTPError(http.StatusBadRequest, "missing refresh token")
 	}
+	refreshToken := cookie.Value
 
 	// Refresh the tokens
-	accessToken, newRefreshToken, err := h.authService.Refresh(c.Request().Context(), refreshToken, c.RealIP())
+	accessToken, newRefreshToken, err := h.authService.Refresh(c.Request().Context(), refreshToken, c.Request().UserAgent())
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 	}
 
 	// Set the tokens in the response
-	c.Response().Header().Set("Authorization", "Bearer "+accessToken)
-	c.Response().Header().Set("Refresh-Token", newRefreshToken)
+	c.Response().Header().Set(AuthorizationHeaderKey, "Bearer "+accessToken)
+
+	c.SetCookie(&http.Cookie{
+		Name:     RefreshTokenCookieName,
+		Value:    newRefreshToken,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   false,
+		SameSite: http.SameSiteStrictMode,
+	})
 
 	return c.NoContent(http.StatusOK)
 }
 
-func (h *Handler) handlePostVerify(c echo.Context) error {
+func (h *Handler) handleGetVerify(c echo.Context) error {
 	// Get the token from the query string
 	token := c.QueryParam("token")
 	if token == "" {
@@ -129,11 +154,10 @@ func (h *Handler) handlePostVerify(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 	}
 
-	return c.NoContent(http.StatusOK)
+	return c.String(http.StatusOK, "Verified")
 }
 
 func (h *Handler) handlePostForgot(c echo.Context) error {
-	// Get the email from the request body
 	var body struct {
 		Email string `json:"email" validate:"required,email"`
 	}
@@ -145,8 +169,8 @@ func (h *Handler) handlePostForgot(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
 	}
 
-	// Send the password reset email
-	if err := h.authService.Forgot(c.Request().Context(), body.Email); err != nil {
+	resetUrl := fmt.Sprintf("%s://%s%s/reset?token=", c.Scheme(), c.Request().Host, strings.TrimSuffix(c.Request().URL.Path, "/forgot"))
+	if err := h.authService.Forgot(c.Request().Context(), body.Email, resetUrl); err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 	}
 
@@ -178,7 +202,7 @@ func (h *Handler) handlePostReset(c echo.Context) error {
 func (h *Handler) authMiddleware(next echo.HandlerFunc) echo.HandlerFunc {
 	return func(c echo.Context) error {
 		// Get the access token from the Authorization header
-		token := c.Request().Header.Get("Authorization")
+		token := c.Request().Header.Get(AuthorizationHeaderKey)
 		if !strings.HasPrefix(token, "Bearer ") {
 			return echo.NewHTTPError(http.StatusUnauthorized, "missing or invalid token")
 		}

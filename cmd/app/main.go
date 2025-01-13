@@ -41,6 +41,7 @@ func main() {
 
 	// Get the port from the environment variables
 	port, _ := strconv.Atoi(os.Getenv("PORT"))
+	smtpPort, _ := strconv.Atoi(os.Getenv("MAIL_PORT"))
 
 	httpServer := transport.NewServer(transport.Opts{
 		Port: port,
@@ -51,6 +52,12 @@ func main() {
 				JWT: service.NewJWT(service.JWTConfig{
 					AccessSecret: []byte(os.Getenv("JWT_ACCESS_SECRET")),
 					AccessTTL:    15 * time.Minute,
+				}),
+				Mail: service.NewMail(service.MailOpts{
+					Email:    os.Getenv("MAIL_EMAIL"),
+					Password: os.Getenv("MAIL_PASSWORD"),
+					SMTPHost: os.Getenv("MAIL_HOST"),
+					SMTPPort: smtpPort,
 				}),
 			}),
 			UserService: service.NewUser(service.UserOpts{

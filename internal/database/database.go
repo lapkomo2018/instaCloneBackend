@@ -9,27 +9,32 @@ import (
 	"gorm.io/gorm"
 )
 
-type Config struct {
-	// Host is the database host.
-	Host string
+type (
+	Database interface {
+		Transaction() *Transaction
+	}
 
-	// Port is the database port.
-	Port string
+	database struct {
+		db *gorm.DB
+	}
 
-	// User is the database user.
-	User string
+	Config struct {
+		// Host is the database host.
+		Host string
+		// Port is the database port.
+		Port string
+		// User is the database user.
+		User string
+		// Password is the database password.
+		Password string
+		// Name is the database name.
+		Name string
+		// Schema is the database schema.
+		Schema string
+	}
+)
 
-	// Password is the database password.
-	Password string
-
-	// Name is the database name.
-	Name string
-
-	// Schema is the database schema.
-	Schema string
-}
-
-func New(cfg Config) (*gorm.DB, error) {
+func New(cfg Config) (Database, error) {
 	// Create the database connection.
 	dsn := fmt.Sprintf("host=%s port=%s user=%s dbname=%s password=%s search_path=%s sslmode=disable", cfg.Host, cfg.Port, cfg.User, cfg.Name, cfg.Password, cfg.Schema)
 
@@ -43,5 +48,13 @@ func New(cfg Config) (*gorm.DB, error) {
 		return nil, err
 	}
 
-	return db, nil
+	return &database{
+		db: db,
+	}, nil
+}
+
+func (db *database) Transaction() *Transaction {
+	return &Transaction{
+		DB: db.db.Begin(),
+	}
 }

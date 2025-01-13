@@ -3,26 +3,29 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"time"
 
+	"instaCloneBackend/internal/database"
 	"instaCloneBackend/internal/model"
 	"instaCloneBackend/pkg/hasher"
 
 	"github.com/google/uuid"
-	"gorm.io/gorm"
 )
 
 type (
 	Auth struct {
-		db     *gorm.DB
+		db     database.Database
 		hasher hasher.Hasher
 		jwt    *JWT
+		mail   *Mail
 	}
 	AuthOpts struct {
-		DB     *gorm.DB
+		DB     database.Database
 		Hasher hasher.Hasher
 		JWT    *JWT
+		Mail   *Mail
 	}
 )
 
@@ -32,6 +35,7 @@ func NewAuth(opts AuthOpts) *Auth {
 		db:     opts.DB,
 		hasher: opts.Hasher,
 		jwt:    opts.JWT,
+		mail:   opts.Mail,
 	}
 }
 
@@ -42,10 +46,14 @@ const (
 )
 
 // Register registers a new user.
-func (a *Auth) Register(ctx context.Context, username, email, password string) (*model.User, error) {
+func (a *Auth) Register(ctx context.Context, username, email, password, verificationUrl string) (*model.User, error) {
+	// Start a transaction and ensure rollback on error or panic.
+	tx := a.db.Transaction()
+	defer tx.EnsureRollback()
+
 	// Check if the username is already taken.
-	if err := a.db.Where("username = ?", username).First(&model.User{}).Error; err != nil {
-		if !errors.Is(err, gorm.ErrRecordNotFound) {
+	if err := tx.Where("username = ?", username).First(&model.User{}).Error; err != nil {
+		if !errors.Is(err, database.ErrRecordNotFound) {
 			return nil, err
 		}
 	} else {
@@ -53,8 +61,8 @@ func (a *Auth) Register(ctx context.Context, username, email, password string) (
 	}
 
 	// Check if the email is already taken.
-	if err := a.db.Where("email = ?", email).First(&model.User{}).Error; err != nil {
-		if !errors.Is(err, gorm.ErrRecordNotFound) {
+	if err := tx.Where("email = ?", email).First(&model.User{}).Error; err != nil {
+		if !errors.Is(err, database.ErrRecordNotFound) {
 			return nil, err
 		}
 	} else {
@@ -86,23 +94,30 @@ func (a *Auth) Register(ctx context.Context, username, email, password string) (
 
 	// Save the user to the database.
 	log.Printf("Saving user with ID: %s to the database", user.ID)
-	if err := a.db.Create(user).Error; err != nil {
+	if err := tx.Create(user).Error; err != nil {
 		return nil, err
 	}
 
 	// Send a verification email.
+	log.Printf("Sending verification email to user with ID: %s", user.ID)
+	verificationUrl = fmt.Sprintf("%s%s", verificationUrl, token.Token)
+	if err := a.mail.SendEmailVerification(user.Email, verificationUrl); err != nil {
+		return nil, err
+	}
 
-	// TODO: Implement this.
-
-	return user, nil
+	return user, tx.Commit().Error
 }
 
 // Verify verifies a user.
 func (a *Auth) Verify(ctx context.Context, token string) error {
+	// Start a transaction and ensure rollback on error or panic.
+	tx := a.db.Transaction()
+	defer tx.EnsureRollback()
+
 	// Get the verification token.
 	log.Printf("Getting verification token with token: %s", token)
 	verificationToken := &model.VerificationToken{}
-	if err := a.db.Where("token = ?", token).First(verificationToken).Error; err != nil {
+	if err := tx.Where("token = ?", token).First(verificationToken).Error; err != nil {
 		return errors.New("token not found")
 	}
 
@@ -121,32 +136,36 @@ func (a *Auth) Verify(ctx context.Context, token string) error {
 	// Verify the user.
 	log.Printf("Verifying user with ID: %s", verificationToken.UserID)
 	user := &model.User{}
-	if err := a.db.Where("id = ?", verificationToken.UserID).First(user).Error; err != nil {
+	if err := tx.Where("id = ?", verificationToken.UserID).First(user).Error; err != nil {
 		return err
 	}
 
 	// Update the user.
 	log.Printf("Updating user with ID: %s", user.ID)
 	user.Verified = true
-	if err := a.db.Save(user).Error; err != nil {
+	if err := tx.Save(user).Error; err != nil {
 		return err
 	}
 
 	// Delete the verification token.
 	log.Printf("Deleting verification token with token: %s", token)
-	if err := a.db.Delete(verificationToken).Error; err != nil {
+	if err := tx.Delete(verificationToken).Error; err != nil {
 		return err
 	}
 
-	return nil
+	return tx.Commit().Error
 }
 
 // Login logs in a user.
 func (a *Auth) Login(ctx context.Context, login, password, deviceInfo string) (string, string, error) {
+	// Start a transaction and ensure rollback on error or panic.
+	tx := a.db.Transaction()
+	defer tx.EnsureRollback()
+
 	// Get the user.
 	user := &model.User{}
-	if err := a.db.Where("username = ? OR email = ?", login, login).First(user).Error; err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
+	if err := tx.Where("username = ? OR email = ?", login, login).First(user).Error; err != nil {
+		if errors.Is(err, database.ErrRecordNotFound) {
 			return "", "", errors.New("user not found")
 		}
 		return "", "", err
@@ -170,23 +189,27 @@ func (a *Auth) Login(ctx context.Context, login, password, deviceInfo string) (s
 		DeviceInfo:   deviceInfo,
 		ExpiresAt:    time.Now().Add(RefreshTokenTTL),
 	}
-	if err := a.db.Create(session).Error; err != nil {
+	if err := tx.Create(session).Error; err != nil {
 		return "", "", err
 	}
 
-	return accessToken, session.RefreshToken, nil
+	return accessToken, session.RefreshToken, tx.Commit().Error
 }
 
 // Refresh refreshes a session.
 func (a *Auth) Refresh(ctx context.Context, refreshToken, deviceInfo string) (string, string, error) {
+	// Start a transaction and ensure rollback on error or panic.
+	tx := a.db.Transaction()
+	defer tx.EnsureRollback()
+
 	// Get the session.
 	session := &model.Session{}
-	if err := a.db.Where("refresh_token = ?", refreshToken).First(session).Error; err != nil {
+	if err := tx.Where("refresh_token = ?", refreshToken).First(session).Error; err != nil {
 		return "", "", errors.New("session not found")
 	}
 
 	// Delete the session.
-	if err := a.db.Delete(session).Error; err != nil {
+	if err := tx.Delete(session).Error; err != nil {
 		log.Printf("failed to delete session: %v", err)
 	}
 
@@ -205,15 +228,19 @@ func (a *Auth) Refresh(ctx context.Context, refreshToken, deviceInfo string) (st
 	session.RefreshToken = uuid.New().String()
 	session.DeviceInfo = deviceInfo
 	session.ExpiresAt = time.Now().Add(RefreshTokenTTL)
-	if err := a.db.Save(session).Error; err != nil {
+	if err := tx.Save(session).Error; err != nil {
 		return "", "", err
 	}
 
-	return accessToken, session.RefreshToken, nil
+	return accessToken, session.RefreshToken, tx.Commit().Error
 }
 
 // Authenticate authenticates a user.
 func (a *Auth) Authenticate(ctx context.Context, accessToken string) (*model.User, error) {
+	// Start a transaction and ensure rollback on error or panic.
+	tx := a.db.Transaction()
+	defer tx.EnsureRollback()
+
 	// Parse the access token.
 	userID, err := a.jwt.ParseAccessToken(accessToken)
 	if err != nil {
@@ -222,51 +249,68 @@ func (a *Auth) Authenticate(ctx context.Context, accessToken string) (*model.Use
 
 	// Get the user.
 	user := &model.User{}
-	if err := a.db.Where("id = ?", userID).First(user).Error; err != nil {
+	if err := tx.Where("id = ?", userID).First(user).Error; err != nil {
 		return nil, err
 	}
 
-	return user, nil
+	return user, tx.Commit().Error
 }
 
 // Logout logs out a user.
 func (a *Auth) Logout(ctx context.Context, refreshToken string) error {
+	// Start a transaction and ensure rollback on error or panic.
+	tx := a.db.Transaction()
+	defer tx.EnsureRollback()
+
 	// Get the session.
 	session := &model.Session{}
-	if err := a.db.Where("refresh_token = ?", refreshToken).First(session).Error; err != nil {
+	if err := tx.Where("refresh_token = ?", refreshToken).First(session).Error; err != nil {
 		return errors.New("session not found")
 	}
 
 	// Delete the session.
-	if err := a.db.Delete(session).Error; err != nil {
+	if err := tx.Delete(session).Error; err != nil {
 		return err
 	}
 
-	return nil
+	return tx.Commit().Error
 }
 
 // LogoutAll logs out all sessions of a user.
 func (a *Auth) LogoutAll(ctx context.Context, userID string) error {
+	// Start a transaction and ensure rollback on error or panic.
+	tx := a.db.Transaction()
+	defer tx.EnsureRollback()
+
 	// Get the sessions.
 	sessions := make([]*model.Session, 0)
-	if err := a.db.Where("user_id = ?", userID).Find(&sessions).Error; err != nil {
+	if err := tx.Where("user_id = ?", userID).Find(&sessions).Error; err != nil {
 		return err
+	}
+
+	// Check if sessions exists
+	if len(sessions) == 0 {
+		return errors.New("user have no sessions")
 	}
 
 	// Delete the sessions.
-	if err := a.db.Delete(&sessions).Error; err != nil {
+	if err := tx.Delete(&sessions).Error; err != nil {
 		return err
 	}
 
-	return nil
+	return tx.Commit().Error
 }
 
 // Forgot sends a password reset email.
-func (a *Auth) Forgot(ctx context.Context, email string) error {
+func (a *Auth) Forgot(ctx context.Context, email, resetUrl string) error {
+	// Start a transaction and ensure rollback on error or panic.
+	tx := a.db.Transaction()
+	defer tx.EnsureRollback()
+
 	// Get the user.
 	user := &model.User{}
-	if err := a.db.Where("email = ?", email).First(user).Error; err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
+	if err := tx.Where("email = ?", email).First(user).Error; err != nil {
+		if errors.Is(err, database.ErrRecordNotFound) {
 			return errors.New("user not found")
 		}
 		return err
@@ -281,21 +325,28 @@ func (a *Auth) Forgot(ctx context.Context, email string) error {
 	}
 
 	// Save the token to the database.
-	if err := a.db.Create(token).Error; err != nil {
+	if err := tx.Create(token).Error; err != nil {
 		return err
 	}
 
 	// Send a password reset email.
-	// TODO: Implement this.
+	resetUrl = fmt.Sprintf("%s%s", resetUrl, token.Token)
+	if err := a.mail.SendPasswordReset(user.Email, resetUrl); err != nil {
+		return err
+	}
 
-	return nil
+	return tx.Commit().Error
 }
 
 // Reset resets a user's password.
 func (a *Auth) Reset(ctx context.Context, token, password string) error {
+	// Start a transaction and ensure rollback on error or panic.
+	tx := a.db.Transaction()
+	defer tx.EnsureRollback()
+
 	// Get the password reset token.
 	passwordToken := &model.VerificationToken{}
-	if err := a.db.Where("token = ?", token).First(passwordToken).Error; err != nil {
+	if err := tx.Where("token = ?", token).First(passwordToken).Error; err != nil {
 		return errors.New("token not found")
 	}
 
@@ -311,20 +362,37 @@ func (a *Auth) Reset(ctx context.Context, token, password string) error {
 
 	// Get the user.
 	user := &model.User{}
-	if err := a.db.Where("id = ?", passwordToken.UserID).First(user).Error; err != nil {
+	if err := tx.Where("id = ?", passwordToken.UserID).First(user).Error; err != nil {
 		return err
+	}
+
+	// Check passwords difference
+	if a.hasher.Compare(user.Password, password) {
+		return errors.New("same password")
 	}
 
 	// Update the user's password.
 	user.Password = a.hasher.Hash(password)
-	if err := a.db.Save(user).Error; err != nil {
+	if err := tx.Save(user).Error; err != nil {
 		return err
 	}
 
 	// Delete the password reset token.
-	if err := a.db.Delete(passwordToken).Error; err != nil {
+	if err := tx.Delete(passwordToken).Error; err != nil {
 		return err
 	}
 
-	return nil
+	// Delete user`s sessions
+	sessions := make([]*model.Session, 0)
+	if err := tx.Where("user_id = ?", user.ID).Find(&sessions).Error; err != nil {
+		return err
+	}
+
+	if len(sessions) > 0 {
+		if err := tx.Delete(sessions).Error; err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit().Error
 }

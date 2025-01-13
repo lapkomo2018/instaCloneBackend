@@ -1,13 +1,15 @@
 package service
 
-import "gorm.io/gorm"
+import (
+	"instaCloneBackend/internal/database"
+)
 
 type (
 	User struct {
-		db *gorm.DB
+		db database.Database
 	}
 	UserOpts struct {
-		DB *gorm.DB
+		DB database.Database
 	}
 )
 
