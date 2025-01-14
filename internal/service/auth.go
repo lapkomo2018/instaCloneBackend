@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math/rand"
+	"strings"
 	"time"
 
 	"instaCloneBackend/internal/database"
@@ -12,6 +14,7 @@ import (
 	"instaCloneBackend/pkg/hasher"
 
 	"github.com/google/uuid"
+	"github.com/markbates/goth"
 )
 
 type (
@@ -174,6 +177,71 @@ func (a *Auth) Login(ctx context.Context, login, password, deviceInfo string) (s
 	// Check if the password is correct.
 	if !a.hasher.Compare(user.Password, password) {
 		return "", "", errors.New("invalid password")
+	}
+
+	// Generate an access token.
+	accessToken, err := a.jwt.GenerateAccessToken(user.ID)
+	if err != nil {
+		return "", "", err
+	}
+
+	// Generate a session.
+	session := &model.Session{
+		RefreshToken: uuid.New().String(),
+		UserID:       user.ID,
+		DeviceInfo:   deviceInfo,
+		ExpiresAt:    time.Now().Add(RefreshTokenTTL),
+	}
+	if err := tx.Create(session).Error; err != nil {
+		return "", "", err
+	}
+
+	return accessToken, session.RefreshToken, tx.Commit().Error
+}
+
+// LoginOAuth logs or registers a new user.
+func (a *Auth) LoginOAuth(ctx context.Context, userInfo goth.User, deviceInfo string) (string, string, error) {
+	// Start a transaction and ensure rollback on error or panic.
+	tx := a.db.Transaction()
+	defer tx.EnsureRollback()
+
+	// Check if user already exists
+	user := &model.User{}
+	if err := tx.Where("email = ?", userInfo.Email).First(user).Error; err != nil {
+		if !errors.Is(err, database.ErrRecordNotFound) {
+			return "", "", err
+		}
+
+		// Generate username from email with rand
+		emailParts := strings.Split(userInfo.Email, "@")
+		username := ""
+		for {
+			username = fmt.Sprintf("%s_%d", emailParts[0], rand.Intn(100000))
+			// Check if username already taken
+			if err := tx.Where("username = ?", username).First(&model.User{}).Error; errors.Is(err, database.ErrRecordNotFound) {
+				break
+			} else if err != nil {
+				return "", "", err
+			}
+		}
+
+		// Register new user
+		user = &model.User{
+			ID:       uuid.New().String(),
+			Username: username,
+			Email:    userInfo.Email,
+			Verified: true,
+			Info: &model.UserInfo{
+				Name:     userInfo.Name,
+				Bio:      userInfo.Description,
+				Avatar:   userInfo.AvatarURL,
+				Location: userInfo.Location,
+			},
+		}
+
+		if err := tx.Create(user).Error; err != nil {
+			return "", "", err
+		}
 	}
 
 	// Generate an access token.

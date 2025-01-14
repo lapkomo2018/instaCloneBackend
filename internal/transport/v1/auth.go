@@ -1,6 +1,7 @@
 package v1
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"strings"
@@ -8,6 +9,7 @@ import (
 	"instaCloneBackend/internal/model"
 
 	"github.com/labstack/echo/v4"
+	"github.com/markbates/goth/gothic"
 )
 
 const (
@@ -24,6 +26,8 @@ func (h *Handler) initAuthRoutes(group *echo.Group) {
 	group.GET("/verify", h.handleGetVerify)
 	group.POST("/forgot", h.handlePostForgot)
 	group.POST("/reset", h.handlePostReset)
+	group.GET("/:provider", h.handleGetProvider)
+	group.GET("/:provider/callback", h.handleGetProviderCallback)
 }
 
 func (h *Handler) handlePostRegister(c echo.Context) error {
@@ -69,19 +73,7 @@ func (h *Handler) handlePostLogin(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 	}
 
-	// Set the tokens in the response
-	c.Response().Header().Set(AuthorizationHeaderKey, "Bearer "+accessToken)
-
-	c.SetCookie(&http.Cookie{
-		Name:     RefreshTokenCookieName,
-		Value:    refreshToken,
-		Path:     "/",
-		HttpOnly: true,
-		Secure:   false, // true in production
-		SameSite: http.SameSiteStrictMode,
-	})
-
-	return c.NoContent(http.StatusOK)
+	return tokenResponse(c, accessToken, refreshToken)
 }
 
 func (h *Handler) handlePostLogout(c echo.Context) error {
@@ -126,19 +118,7 @@ func (h *Handler) handlePostRefresh(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 	}
 
-	// Set the tokens in the response
-	c.Response().Header().Set(AuthorizationHeaderKey, "Bearer "+accessToken)
-
-	c.SetCookie(&http.Cookie{
-		Name:     RefreshTokenCookieName,
-		Value:    newRefreshToken,
-		Path:     "/",
-		HttpOnly: true,
-		Secure:   false,
-		SameSite: http.SameSiteStrictMode,
-	})
-
-	return c.NoContent(http.StatusOK)
+	return tokenResponse(c, accessToken, newRefreshToken)
 }
 
 func (h *Handler) handleGetVerify(c echo.Context) error {
@@ -199,6 +179,25 @@ func (h *Handler) handlePostReset(c echo.Context) error {
 	return c.NoContent(http.StatusOK)
 }
 
+func (h *Handler) handleGetProvider(c echo.Context) error {
+	gothic.BeginAuthHandler(c.Response(), c.Request().WithContext(context.WithValue(c.Request().Context(), "provider", c.Param("provider"))))
+	return nil
+}
+
+func (h *Handler) handleGetProviderCallback(c echo.Context) error {
+	user, err := gothic.CompleteUserAuth(c.Response(), c.Request().WithContext(context.WithValue(c.Request().Context(), "provider", c.Param("provider"))))
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+
+	accessToken, refreshToken, err := h.authService.LoginOAuth(c.Request().Context(), user, c.Request().UserAgent())
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+
+	return tokenResponse(c, accessToken, refreshToken)
+}
+
 func (h *Handler) authMiddleware(next echo.HandlerFunc) echo.HandlerFunc {
 	return func(c echo.Context) error {
 		// Get the access token from the Authorization header
@@ -219,4 +218,24 @@ func (h *Handler) authMiddleware(next echo.HandlerFunc) echo.HandlerFunc {
 
 		return next(c)
 	}
+}
+
+func tokenResponse(c echo.Context, accessToken string, refreshToken string) error {
+	// Set the tokens in the response
+	c.Response().Header().Set(AuthorizationHeaderKey, "Bearer "+accessToken)
+
+	c.SetCookie(&http.Cookie{
+		Name:     RefreshTokenCookieName,
+		Value:    refreshToken,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   false, // true in production
+		SameSite: http.SameSiteStrictMode,
+	})
+
+	return c.JSON(http.StatusOK, echo.Map{
+		"message":       "Login successful",
+		"access_token":  accessToken,
+		"refresh_token": refreshToken,
+	})
 }

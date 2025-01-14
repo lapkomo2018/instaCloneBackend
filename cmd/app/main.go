@@ -18,6 +18,8 @@ import (
 	"instaCloneBackend/pkg/hasher"
 
 	"github.com/joho/godotenv"
+	"github.com/markbates/goth"
+	"github.com/markbates/goth/providers/google"
 )
 
 func main() {
@@ -38,6 +40,10 @@ func main() {
 	if err != nil {
 		log.Fatalf("database error: %v", err)
 	}
+
+	goth.UseProviders(
+		google.New(os.Getenv("OAUTH_GOOGLE_CLIENT_ID"), os.Getenv("OAUTH_GOOGLE_CLIENT_SECRET"), "http://localhost:8080/v1/auth/google/callback", "email", "profile"),
+	)
 
 	// Get the port from the environment variables
 	port, _ := strconv.Atoi(os.Getenv("PORT"))
